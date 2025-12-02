@@ -5,55 +5,203 @@ require("dotenv").config();
 const app = express();
 app.use(cors());
 app.use(express.json());
+app.set("json spaces", 2);
 
+// Config
 const PORT = process.env.PORT || 3000;
+const COOKIE = process.env.ROBLOX_COOKIE;
 
-const serverEndpoint = "https://games.roblox.com/v1/games/";
-const presenceEndpoint = "https://presence.roblox.com/v1/presence/users";
+const API = {
+  servers: "https://games.roblox.com/v1/games",
+  presence: "https://presence.roblox.com/v1/presence/users",
+  auth: "https://users.roblox.com/v1/users/authenticated",
+  csrf: "https://auth.roblox.com/v2/logout",
+};
 
-const cookie = process.env.ROBLOX_COOKIE;
+// === Helpers ===
+// Build a Roblox join link for a given placeId and gameId
+const buildJoinLink = (placeId, gameId) =>
+  `roblox://experiences/start?placeId=${placeId}&gameInstanceId=${gameId}`;
 
-// Helper to format servers with join links as plain text
-function formatServersWithJoinLinks(servers, placeId) {
+// Fetch CSRF token using the provided cookie
+async function getCsrfToken() {
+  const res = await fetch(API.csrf, {
+    method: "POST",
+    headers: { Cookie: COOKIE },
+  });
+  return res.headers.get("x-csrf-token");
+}
+
+// Fetch servers for a given placeId with optional sorting and pagination
+async function fetchServers(placeId, { sortOrder = "Desc", cursor = null } = {}) {
+  const params = new URLSearchParams({
+    sortOrder,
+    excludeFullGames: "true",
+    limit: "100",
+  });
+  if (cursor) params.set("cursor", cursor);
+
+  const res = await fetch(`${API.servers}/${placeId}/servers/0?${params}`, {
+    headers: { Cookie: COOKIE },
+  });
+  return res.json();
+}
+
+// Fetch presence information for a list of userIds
+async function getPresences(userIds, csrfToken) {
+  const res = await fetch(API.presence, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Cookie: COOKIE,
+      "x-csrf-token": csrfToken,
+    },
+    body: JSON.stringify({ userIds }),
+  });
+  return res.json();
+}
+
+// Fetch server region
+async function getServerRegion(placeId, serverId) {
+  try {
+    const csrfToken = await getCsrfToken();
+
+    const joinRes = await fetch("https://gamejoin.roblox.com/v1/join-game-instance", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Cookie: COOKIE,
+        "x-csrf-token": csrfToken,
+        "Referer": `https://www.roblox.com/games/${placeId}`,
+        "Origin": "https://roblox.com",
+        "User-Agent": "Roblox/WinInet"
+      },
+      body: JSON.stringify({
+        placeId: parseInt(placeId),
+        isTeleport: false,
+        gameId: serverId,
+        gameJoinAttemptId: serverId
+      }),
+    });
+
+    let joinData = await joinRes.json();
+
+    console.log("Init join response:", JSON.stringify(joinData, null, 2));
+
+    if (joinData.status === 22 && joinData.jobId) {
+      const maxRetries = 10;
+      for (let i = 0; i < maxRetries; i++) {
+        await new Promise(resolve => setTimeout(resolve, 1000));
+
+        const pollRes = await fetch(`https://gamejoin.roblox.com/v1/join-game-instance`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Cookie: COOKIE,
+            "x-csrf-token": csrfToken,
+            "Referer": `https://www.roblox.com/games/${placeId}`,
+            "Origin": "https://roblox.com",
+            "User-Agent": "Roblox/WinInet"
+          },
+          body: JSON.stringify({
+            placeId: parseInt(placeId),
+            isTeleport: false,
+            gameId: serverId,
+            gameJoinAttemptId: serverId
+          }),
+        });
+
+        joinData = await pollRes.json();
+        console.log(`Poll join response (attempt ${i + 1}):, status ${joinData.status}`);
+
+        if (joinData.status !== 22) break;
+      }
+    }
+
+    if (!joinData.joinScript?.UdmuxEndpoints?.[0]?.Address) {
+      console.log("No IP found in join response, status:", joinData.status, "Message:", joinData.message);
+      return null;
+    }
+
+    const ip = joinData.joinScript.UdmuxEndpoints[0].Address;
+    console.log("Server IP:", ip);
+
+    const geoRes = await fetch(`http://ip-api.com/json/${ip}`);
+    const geo = await geoRes.json();
+
+    console.log("Geo data:", geo);
+
+    return {
+      ip,
+      country: geo.country,
+      countryCode: geo.countryCode,
+      region: geo.regionName,
+      city: geo.city,
+      lat: geo.lat,
+      lon: geo.lon
+    };
+  } catch (error) {
+    console.error("Error fetching server region:", error);
+    return { error: error.message };
+  }
+}
+
+// Format server data into a readable text format
+function formatServers(servers, placeId) {
   let text = `Total Servers: ${servers.length}\n\n`;
 
-  servers.forEach((server, index) => {
-    text += `Server ${index + 1}:\n`;
+  servers.forEach((server, i) => {
+    text += `Server ${i + 1}:\n`;
     text += `  ID: ${server.id}\n`;
     text += `  Players: ${server.playing}/${server.maxPlayers}\n`;
     text += `  FPS: ${server.fps.toFixed(2)}\n`;
     text += `  Ping: ${server.ping}ms\n`;
     text += `  Player Tokens: ${server.playerTokens?.length || 0}\n`;
-    text += `  Join Link: roblox://experiences/start?placeId=${placeId}&gameInstanceId=${server.id}\n`;
-    text += `\n`;
+    text += `  Join Link: ${buildJoinLink(placeId, server.id)}\n\n`;
   });
 
   return text;
 }
 
-// Get servers
+// Send response in either JSON or formatted text
+function sendResponse(res, data, parsed, placeId) {
+  if (parsed) {
+    res.set("Content-Type", "text/plain");
+    res.send(formatServers(data.servers, placeId));
+  } else {
+    res.json(data);
+  }
+}
+
+// === Routes ===
+// Test authentication by fetching authenticated user info
+app.get("/api/test-auth", async (req, res) => {
+  try {
+    const response = await fetch(API.auth, { headers: { Cookie: COOKIE } });
+    res.json(await response.json());
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Fetch servers for a given placeId with optional limit and parsed format
 app.get("/api/servers/:placeId", async (req, res) => {
   const { placeId } = req.params;
   const limit = req.query.limit ? parseInt(req.query.limit) : null;
   const parsed = req.query.parsed === "true";
+
+  if (!/^\d+$/.test(placeId)) {
+    return res.status(400).json({ error: "Invalid placeId" });
+  }
 
   try {
     let servers = [];
     let cursor = null;
 
     while (true) {
-      const url = `${serverEndpoint}${placeId}/servers/0?sortOrder=Desc&limit=100${
-        cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""
-      }`;
+      const data = await fetchServers(placeId, { cursor });
 
-      const response = await fetch(url, {
-        headers: { Cookie: cookie },
-      });
-      const data = await response.json();
-
-      if (data.data) {
-        servers = servers.concat(data.data);
-      }
+      if (data.data) servers.push(...data.data);
 
       if (limit && servers.length >= limit) {
         servers = servers.slice(0, limit);
@@ -64,60 +212,24 @@ app.get("/api/servers/:placeId", async (req, res) => {
       cursor = data.nextPageCursor;
     }
 
-    if (parsed) {
-      res.set("Content-Type", "text/plain");
-      res.send(formatServersWithJoinLinks(servers, placeId));
-    } else {
-      res.json({
-        servers,
-        totalServers: servers.length,
-      });
-    }
+    sendResponse(res, { servers, totalServers: servers.length }, parsed, placeId);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
-// Test authentication
-app.get("/api/test-auth", async (req, res) => {
-  const testRes = await fetch(
-    "https://users.roblox.com/v1/users/authenticated",
-    {
-      headers: { Cookie: cookie },
-    }
-  );
-  const testData = await testRes.json();
-  res.json(testData);
-});
-
-// POST filtered servers (friends only) - AGGRESSIVE SEARCH
+// Fetch servers where friends are present for a given placeId
 app.post("/api/servers/filtered/:placeId", async (req, res) => {
   const { placeId } = req.params;
   const { friendIds, parsed } = req.body;
 
-  if (!friendIds || friendIds.length === 0) {
-    return res.status(400).json({
-      error: "friendIds required for filtered endpoint",
-    });
+  if (!friendIds?.length) {
+    return res.status(400).json({ error: "friendIds required" });
   }
 
   try {
-    const csrfRes = await fetch("https://auth.roblox.com/v2/logout", {
-      method: "POST",
-      headers: { Cookie: cookie },
-    });
-    const csrfToken = csrfRes.headers.get("x-csrf-token");
-
-    const presenceRes = await fetch(presenceEndpoint, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Cookie: cookie,
-        "x-csrf-token": csrfToken,
-      },
-      body: JSON.stringify({ userIds: friendIds }),
-    });
-    const presenceData = await presenceRes.json();
+    const csrfToken = await getCsrfToken();
+    const presenceData = await getPresences(friendIds, csrfToken);
 
     const friendGameIds = new Set(
       presenceData.userPresences
@@ -125,91 +237,52 @@ app.post("/api/servers/filtered/:placeId", async (req, res) => {
         .map((p) => p.gameId)
     );
 
-    let matchingServers = [];
-    let allServers = new Map(); // Use Map to avoid duplicates
+    const matchingServers = [];
+    const seenServers = new Set();
     let totalSearched = 0;
     let pages = 0;
 
-    // Try multiple sort orders to get different server sets
-    const sortOrders = ["Desc", "Asc"];
-
-    for (const sortOrder of sortOrders) {
+    for (const sortOrder of ["Desc", "Asc"]) {
       let cursor = null;
-      let pagesForThisSort = 0;
+      let sortPages = 0;
 
-      console.log(`\n--- Searching with sortOrder: ${sortOrder} ---`);
+      while (sortPages < 20) {
+        const data = await fetchServers(placeId, { sortOrder, cursor });
 
-      while (pagesForThisSort < 20) {
-        // Max 20 pages per sort order
-        const url = `${serverEndpoint}${placeId}/servers/0?sortOrder=${sortOrder}&excludeFullGames=false&limit=100${
-          cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""
-        }`;
+        for (const server of data.data || []) {
+          if (seenServers.has(server.id)) continue;
+          seenServers.add(server.id);
+          totalSearched++;
 
-        const serverRes = await fetch(url, {
-          headers: { Cookie: cookie },
-        });
-        const serverData = await serverRes.json();
-
-        if (serverData.data) {
-          for (const server of serverData.data) {
-            if (!allServers.has(server.id)) {
-              allServers.set(server.id, server);
-              totalSearched++;
-
-              if (friendGameIds.has(server.id)) {
-                matchingServers.push(server);
-                console.log(`Server with friend found: ${server.id}`);
-              }
-            }
+          if (friendGameIds.has(server.id)) {
+            matchingServers.push(server);
           }
         }
 
         pages++;
-        pagesForThisSort++;
-        console.log(
-          `Page ${pages} (${sortOrder}): ${
-            serverData.data?.length || 0
-          } servers, unique total: ${allServers.size}`
-        );
+        sortPages++;
 
-        // Found all friends
-        if (matchingServers.length >= friendIds.length) {
-          console.log(`Found all ${friendIds.length} friends!`);
-          break;
-        }
-
-        if (!serverData.nextPageCursor) {
-          console.log(`No more pages for ${sortOrder}`);
-          break;
-        }
-
-        cursor = serverData.nextPageCursor;
+        if (matchingServers.length >= friendGameIds.size) break;
+        if (!data.nextPageCursor) break;
+        cursor = data.nextPageCursor;
       }
 
-      // If we found all friends, stop trying other sort orders
-      if (matchingServers.length >= friendIds.length) break;
+      if (matchingServers.length >= friendGameIds.size) break;
     }
 
-    console.log(
-      `\nFinal: Searched ${totalSearched} servers across ${pages} pages`
-    );
-
     if (parsed) {
-      let text = formatServersWithJoinLinks(matchingServers, placeId);
-
+      let text = formatServers(matchingServers, placeId);
       text += `\nFriend Presences:\n`;
+
       presenceData.userPresences.forEach((p) => {
         text += `  User ${p.userId}: ${p.lastLocation || "Unknown"}\n`;
         if (p.gameId) {
-          text += `    Game ID: ${p.gameId}\n`;
-          text += `    Join Link: roblox://experiences/start?placeId=${p.placeId}&gameInstanceId=${p.gameId}\n`;
+          text += `    Join: ${buildJoinLink(p.placeId, p.gameId)}\n`;
         }
       });
 
-      text += `\nDebug: Searched ${totalSearched} servers across ${pages} pages\n`;
-
-      res.set("Content-Type", "text/plain");
-      res.send(text);
+      text += `\nSearched ${totalSearched} servers across ${pages} pages\n`;
+      res.set("Content-Type", "text/plain").send(text);
     } else {
       res.json({
         servers: matchingServers,
@@ -218,14 +291,9 @@ app.post("/api/servers/filtered/:placeId", async (req, res) => {
           .filter((p) => p.gameId && p.placeId?.toString() === placeId)
           .map((p) => ({
             userId: p.userId,
-            joinUrl: `roblox://experiences/start?placeId=${p.placeId}&gameInstanceId=${p.gameId}`,
+            joinUrl: buildJoinLink(p.placeId, p.gameId),
           })),
-        debug: {
-          totalServersSearched: totalSearched,
-          uniqueServers: allServers.size,
-          pagesSearched: pages,
-          lookingFor: Array.from(friendGameIds),
-        },
+        debug: { totalSearched, uniqueServers: seenServers.size, pages },
       });
     }
   } catch (error) {
@@ -233,6 +301,57 @@ app.post("/api/servers/filtered/:placeId", async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Server is running on port ${PORT}`);
+// Region endpoint
+app.get("/api/servers/:placeId/region/", async (req, res) => {
+  const { placeId } = req.params;
+  const limit = req.query.limit ? parseInt(req.query.limit) : 10;
+  const filterRegion = req.query.region;
+  const skip = req.query.skip ? parseInt(req.query.skip) : 70;
+
+  try {
+    const data = await fetchServers(placeId);
+    const availableServers = data.data?.filter(s => s.playing < s.maxPlayers) || [];
+
+    console.log(`Total available servers: ${availableServers.length}`);
+
+    const serversWithRegion = [];
+    let attempted = 0;
+    let index = skip;
+
+    while (serversWithRegion.length < limit && index < availableServers.length) {
+      const server = availableServers[index];
+      console.log(`Fetching region for server ${index}: ${server.playing}/${server.maxPlayers} players`);
+
+      const region = await getServerRegion(placeId, server.id);
+      attempted++;
+
+      if (region && !region.error && region.ip) {
+        serversWithRegion.push({ ...server, region });
+        console.log(`Added server ${server.id} with region ${region.countryCode}`);
+      } else {
+        console.log(`Failed to get region for server ${server.id}: ${region?.error || 'Unknown error'}`);
+      }
+      
+      index++;
+
+      if (attempted > 50) break;
+    }
+
+    let filtered = serversWithRegion;
+    if (filterRegion) {
+      filtered = serversWithRegion.filter(s =>
+        s.region?.countryCode === filterRegion.toUpperCase()
+      );
+    }
+
+    res.json({
+      servers: filtered,
+      total: filtered.length,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
+
+// === Start Server ===
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
