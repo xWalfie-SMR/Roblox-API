@@ -141,9 +141,6 @@ async function getServerRegion(placeId, serverId) {
     const ip = joinData.joinScript.UdmuxEndpoints[0].Address;
     console.log("Server IP:", ip);
 
-    // Rate limit
-    await new Promise((resolve) => setTimeout(resolve, 500));
-
     const geo = geoip.lookup(ip);
 
     if (!geo) {
@@ -346,55 +343,38 @@ app.get("/api/servers/:placeId/region", async (req, res) => {
       }`
     );
 
+    const batchSize = 10;
     const matchingServers = [];
     let attempted = 0;
     let index = skip;
     let checkedServers = [];
 
-    while (
-      matchingServers.length < limit &&
-      index < availableServers.length &&
-      attempted < 100
-    ) {
-      const server = availableServers[index];
-      console.log(
-        `Fetching region for server ${index}: ${server.playing}/${server.maxPlayers} players`
+    while (matchingServers.length < limit && index < availableServers.length && attempted < 100) {
+      const batch = availableServers.slice(index, index + batchSize);
+
+      const results = await Promise.all(
+        batch.map(async (server) => {
+          console.log(`Fetching region for server ${server.playing}/${server.maxPlayers} players`);
+          const regionData = await getServerRegion(placeId, server.id);
+          return { server, regionData };
+        })
       );
 
-      const region = await getServerRegion(placeId, server.id);
-      attempted++;
+      for (const { server, regionData } of results) {
+        attempted++;
 
-      if (region && !region.error && region.ip) {
-        const serverWithRegion = { ...server, region };
-        checkedServers.push(serverWithRegion);
+        if (regionData && !regionData.error && regionData.ip) {
+          const serverWithRegion = { ...server, regionData };
+          checkedServers.push(serverWithRegion);
 
-        if (
-          !filterRegion ||
-          region.countryCode === filterRegion.toUpperCase()
-        ) {
-          matchingServers.push(serverWithRegion);
-          console.log(
-            `Added server ${server.id} from ${region.countryCode} (${matchingServers.length}/${limit})`
-          );
-        } else {
-          console.log(
-            `Skipped server ${server.id} from ${region.countryCode} (looking for ${filterRegion})`
-          );
+          if (!filterRegion || regionData.countryCode === filterRegion.toUpperCase()) {
+            matchingServers.push(serverWithRegion);
+            console.log(`Added server ${server.id} from region ${regionData.countryCode} (${matchingServers.length}/${limit})`);
+          }
         }
-      } else {
-        console.log(
-          `Failed to get region for server ${server.id}: ${
-            region?.error || "Unknown error"
-          }`
-        );
       }
-
-      index++;
+      index += batchSize;
     }
-
-    console.log(
-      `Searched ${attempted} servers, found ${matchingServers.length} matching servers`
-    );
 
     res.json({
       servers: matchingServers,
