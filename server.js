@@ -302,7 +302,7 @@ app.post("/api/servers/filtered/:placeId", async (req, res) => {
 });
 
 // Region endpoint
-app.get("/api/servers/:placeId/region/", async (req, res) => {
+app.get("/api/servers/:placeId/region", async (req, res) => {
   const { placeId } = req.params;
   const limit = req.query.limit ? parseInt(req.query.limit) : 10;
   const filterRegion = req.query.region;
@@ -313,12 +313,15 @@ app.get("/api/servers/:placeId/region/", async (req, res) => {
     const availableServers = data.data?.filter(s => s.playing < s.maxPlayers) || [];
 
     console.log(`Total available servers: ${availableServers.length}`);
+    console.log(`Looking for ${limit} servers${filterRegion ? ` in region ${filterRegion}` : ''}`);
 
-    const serversWithRegion = [];
+    const matchingServers = [];
     let attempted = 0;
     let index = skip;
+    let checkedServers = [];
 
-    while (serversWithRegion.length < limit && index < availableServers.length) {
+    // Keep searching until we find enough matching servers or run out of servers to check
+    while (matchingServers.length < limit && index < availableServers.length && attempted < 100) {
       const server = availableServers[index];
       console.log(`Fetching region for server ${index}: ${server.playing}/${server.maxPlayers} players`);
 
@@ -326,27 +329,34 @@ app.get("/api/servers/:placeId/region/", async (req, res) => {
       attempted++;
 
       if (region && !region.error && region.ip) {
-        serversWithRegion.push({ ...server, region });
-        console.log(`Added server ${server.id} with region ${region.countryCode}`);
+        const serverWithRegion = { ...server, region };
+        checkedServers.push(serverWithRegion);
+        
+        // Only add to matchingServers if it matches the filter (or no filter specified)
+        if (!filterRegion || region.countryCode === filterRegion.toUpperCase()) {
+          matchingServers.push(serverWithRegion);
+          console.log(`Added server ${server.id} from ${region.countryCode} (${matchingServers.length}/${limit})`);
+        } else {
+          console.log(`Skipped server ${server.id} from ${region.countryCode} (looking for ${filterRegion})`);
+        }
       } else {
         console.log(`Failed to get region for server ${server.id}: ${region?.error || 'Unknown error'}`);
       }
       
       index++;
-
-      if (attempted > 50) break;
     }
 
-    let filtered = serversWithRegion;
-    if (filterRegion) {
-      filtered = serversWithRegion.filter(s =>
-        s.region?.countryCode === filterRegion.toUpperCase()
-      );
-    }
+    console.log(`Searched ${attempted} servers, found ${matchingServers.length} matching servers`);
 
     res.json({
-      servers: filtered,
-      total: filtered.length,
+      servers: matchingServers,
+      total: matchingServers.length,
+      debug: {
+        attempted,
+        checkedTotal: checkedServers.length,
+        matchingTotal: matchingServers.length,
+        searchedIndices: `${skip}-${index - 1}`
+      }
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
