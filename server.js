@@ -20,11 +20,9 @@ const API = {
 };
 
 // === Helpers ===
-// Build a Roblox join link for a given placeId and gameId
 const buildJoinLink = (placeId, gameId) =>
   `roblox://experiences/start?placeId=${placeId}&gameInstanceId=${gameId}`;
 
-// Fetch CSRF token using the provided cookie
 async function getCsrfToken() {
   const res = await fetch(API.csrf, {
     method: "POST",
@@ -33,7 +31,6 @@ async function getCsrfToken() {
   return res.headers.get("x-csrf-token");
 }
 
-// Fetch servers for a given placeId with optional sorting and pagination
 async function fetchServers(
   placeId,
   { sortOrder = "Desc", cursor = null } = {}
@@ -51,7 +48,6 @@ async function fetchServers(
   return res.json();
 }
 
-// Fetch presence information for a list of userIds
 async function getPresences(userIds, csrfToken) {
   const res = await fetch(API.presence, {
     method: "POST",
@@ -65,7 +61,6 @@ async function getPresences(userIds, csrfToken) {
   return res.json();
 }
 
-// Fetch server region
 async function getServerRegion(placeId, serverId) {
   try {
     const csrfToken = await getCsrfToken();
@@ -92,7 +87,12 @@ async function getServerRegion(placeId, serverId) {
     );
 
     let joinData = await joinRes.json();
-    console.log("Init join response:", joinData.status, "queue:", joinData.queuePosition);
+    console.log(
+      "Init join response:",
+      joinData.status,
+      "queue:",
+      joinData.queuePosition
+    );
 
     if (joinData.status === 22 && joinData.jobId) {
       const maxRetries = 5;
@@ -127,7 +127,6 @@ async function getServerRegion(placeId, serverId) {
       }
     }
 
-    // Check for valid IP in response
     if (!joinData.joinScript?.UdmuxEndpoints?.[0]?.Address) {
       console.log(
         "No IP found in join response, status:",
@@ -165,7 +164,6 @@ async function getServerRegion(placeId, serverId) {
   }
 }
 
-// Format server data into a readable text format
 function formatServers(servers, placeId) {
   let text = `Total Servers: ${servers.length}\n\n`;
 
@@ -175,14 +173,15 @@ function formatServers(servers, placeId) {
     text += `  Players: ${server.playing}/${server.maxPlayers}\n`;
     text += `  FPS: ${server.fps.toFixed(2)}\n`;
     text += `  Ping: ${server.ping}ms\n`;
-    text += `  Player Tokens: ${server.playerTokens?.length || 0}\n`;
+    if (server.regionData) {
+      text += `  Region: ${server.regionData.city}, ${server.regionData.country}\n`;
+    }
     text += `  Join Link: ${buildJoinLink(placeId, server.id)}\n\n`;
   });
 
   return text;
 }
 
-// Send response in either JSON or formatted text
 function sendResponse(res, data, parsed, placeId) {
   if (parsed) {
     res.set("Content-Type", "text/plain");
@@ -193,7 +192,6 @@ function sendResponse(res, data, parsed, placeId) {
 }
 
 // === Routes ===
-// Test authentication by fetching authenticated user info
 app.get("/api/test-auth", async (req, res) => {
   try {
     const response = await fetch(API.auth, { headers: { Cookie: COOKIE } });
@@ -203,7 +201,6 @@ app.get("/api/test-auth", async (req, res) => {
   }
 });
 
-// Fetch servers for a given placeId with optional limit and parsed format
 app.get("/api/servers/:placeId", async (req, res) => {
   const { placeId } = req.params;
   const limit = req.query.limit ? parseInt(req.query.limit) : null;
@@ -242,7 +239,6 @@ app.get("/api/servers/:placeId", async (req, res) => {
   }
 });
 
-// Fetch servers where friends are present for a given placeId
 app.post("/api/servers/filtered/:placeId", async (req, res) => {
   const { placeId } = req.params;
   const { friendIds, parsed } = req.body;
@@ -325,16 +321,17 @@ app.post("/api/servers/filtered/:placeId", async (req, res) => {
   }
 });
 
-// Region endpoint
 app.get("/api/servers/:placeId/region", async (req, res) => {
   const { placeId } = req.params;
   const limit = req.query.limit ? parseInt(req.query.limit) : 10;
   const filterRegion = req.query.region;
   const skip = req.query.skip ? parseInt(req.query.skip) : 0;
+  const parsed = req.query.parsed === "true";
 
   try {
     const data = await fetchServers(placeId);
-    const availableServers = data.data?.filter((s) => s.playing < s.maxPlayers) || [];
+    const availableServers =
+      data.data?.filter((s) => s.playing < s.maxPlayers) || [];
 
     console.log(`Total available servers: ${availableServers.length}`);
     console.log(
@@ -349,12 +346,18 @@ app.get("/api/servers/:placeId/region", async (req, res) => {
     let index = skip;
     let checkedServers = [];
 
-    while (matchingServers.length < limit && index < availableServers.length && attempted < 100) {
+    while (
+      matchingServers.length < limit &&
+      index < availableServers.length &&
+      attempted < 100
+    ) {
       const batch = availableServers.slice(index, index + batchSize);
 
       const results = await Promise.all(
         batch.map(async (server) => {
-          console.log(`Fetching region for server ${server.playing}/${server.maxPlayers} players`);
+          console.log(
+            `Fetching region for server ${server.playing}/${server.maxPlayers} players`
+          );
           const regionData = await getServerRegion(placeId, server.id);
           return { server, regionData };
         })
@@ -367,13 +370,24 @@ app.get("/api/servers/:placeId/region", async (req, res) => {
           const serverWithRegion = { ...server, regionData };
           checkedServers.push(serverWithRegion);
 
-          if (!filterRegion || regionData.countryCode === filterRegion.toUpperCase()) {
+          if (
+            !filterRegion ||
+            regionData.countryCode === filterRegion.toUpperCase()
+          ) {
             matchingServers.push(serverWithRegion);
-            console.log(`Added server ${server.id} from region ${regionData.countryCode} (${matchingServers.length}/${limit})`);
+            console.log(
+              `Added server ${server.id} from region ${regionData.countryCode} (${matchingServers.length}/${limit})`
+            );
           }
         }
       }
       index += batchSize;
+    }
+
+    if (parsed) {
+      return res
+        .set("Content-Type", "text/plain")
+        .send(formatServers(matchingServers, placeId));
     }
 
     res.json({
@@ -391,5 +405,4 @@ app.get("/api/servers/:placeId/region", async (req, res) => {
   }
 });
 
-// === Start Server ===
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
