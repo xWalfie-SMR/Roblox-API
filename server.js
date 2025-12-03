@@ -8,7 +8,7 @@ app.use(cors());
 app.use(express.json());
 app.set("json spaces", 2);
 
-// Config
+// === Config ===
 const PORT = process.env.PORT || 3000;
 const COOKIE = process.env.ROBLOX_COOKIE;
 
@@ -65,6 +65,7 @@ async function getServerRegion(placeId, serverId) {
   try {
     const csrfToken = await getCsrfToken();
 
+    // Initial join request
     const joinRes = await fetch(
       "https://gamejoin.roblox.com/v1/join-game-instance",
       {
@@ -94,6 +95,7 @@ async function getServerRegion(placeId, serverId) {
       joinData.queuePosition
     );
 
+    // Polling for queue status
     if (joinData.status === 22 && joinData.jobId) {
       const maxRetries = 5;
       for (let i = 0; i < maxRetries; i++) {
@@ -127,6 +129,7 @@ async function getServerRegion(placeId, serverId) {
       }
     }
 
+    // Check if join returned an IP address
     if (!joinData.joinScript?.UdmuxEndpoints?.[0]?.Address) {
       console.log(
         "No IP found in join response, status:",
@@ -140,6 +143,7 @@ async function getServerRegion(placeId, serverId) {
     const ip = joinData.joinScript.UdmuxEndpoints[0].Address;
     console.log("Server IP:", ip);
 
+    // GeoIP lookup
     const geo = geoip.lookup(ip);
 
     if (!geo) {
@@ -164,6 +168,7 @@ async function getServerRegion(placeId, serverId) {
   }
 }
 
+// === Response Formatting ===
 function formatServers(servers, placeId) {
   let text = `Total Servers: ${servers.length}\n\n`;
 
@@ -201,6 +206,7 @@ app.get("/api/test-auth", async (req, res) => {
   }
 });
 
+// Fetch game server
 app.get("/api/servers/:placeId", async (req, res) => {
   const { placeId } = req.params;
   const limit = req.query.limit ? parseInt(req.query.limit) : null;
@@ -214,6 +220,7 @@ app.get("/api/servers/:placeId", async (req, res) => {
     let servers = [];
     let cursor = null;
 
+    // Paginate through servers
     while (true) {
       const data = await fetchServers(placeId, { cursor });
 
@@ -239,6 +246,7 @@ app.get("/api/servers/:placeId", async (req, res) => {
   }
 });
 
+// Fetch servers that have friends
 app.post("/api/servers/filtered/:placeId", async (req, res) => {
   const { placeId } = req.params;
   const { friendIds, parsed } = req.body;
@@ -262,6 +270,7 @@ app.post("/api/servers/filtered/:placeId", async (req, res) => {
     let totalSearched = 0;
     let pages = 0;
 
+    // Search servers in both sort orders
     for (const sortOrder of ["Desc", "Asc"]) {
       let cursor = null;
       let sortPages = 0;
@@ -290,6 +299,7 @@ app.post("/api/servers/filtered/:placeId", async (req, res) => {
       if (matchingServers.length >= friendGameIds.size) break;
     }
 
+    // Checks if parsed response is requested
     if (parsed) {
       let text = formatServers(matchingServers, placeId);
       text += `\nFriend Presences:\n`;
@@ -321,6 +331,7 @@ app.post("/api/servers/filtered/:placeId", async (req, res) => {
   }
 });
 
+// Fetch servers by region
 app.get("/api/servers/:placeId/region", async (req, res) => {
   const { placeId } = req.params;
   const limit = req.query.limit ? parseInt(req.query.limit) : 10;
@@ -351,8 +362,14 @@ app.get("/api/servers/:placeId/region", async (req, res) => {
       index < availableServers.length &&
       attempted < 100
     ) {
-      const batch = availableServers.slice(index, index + batchSize);
+      const remaining = limit - matchingServers.length;
+      const currentBatchSize = filterRegion
+        ? batchSize
+        : Math.min(batchSize, remaining);
 
+      const batch = availableServers.slice(index, index + currentBatchSize);
+
+      // Fetch regions in parallel
       const results = await Promise.all(
         batch.map(async (server) => {
           console.log(
@@ -370,10 +387,12 @@ app.get("/api/servers/:placeId/region", async (req, res) => {
           const serverWithRegion = { ...server, regionData };
           checkedServers.push(serverWithRegion);
 
+          // Check region filter
           if (
             !filterRegion ||
             regionData.countryCode === filterRegion.toUpperCase()
           ) {
+            if (matchingServers.length >= limit) break;
             matchingServers.push(serverWithRegion);
             console.log(
               `Added server ${server.id} from region ${regionData.countryCode} (${matchingServers.length}/${limit})`
@@ -405,4 +424,5 @@ app.get("/api/servers/:placeId/region", async (req, res) => {
   }
 });
 
+// === Start Server ===
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
